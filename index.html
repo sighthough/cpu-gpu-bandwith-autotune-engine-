@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal System Hardware Interconnect Auto-Tuner</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+            background-color: #0d1117;
+            color: #c9d1d9;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 { color: #58a6ff; margin-bottom: 5px; }
+        h2 { color: #f0f6fc; margin-top: 35px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+        p { color: #8b949e; font-size: 14px; line-height: 1.5; }
+        .controls { display: flex; gap: 10px; margin-top: 15px; }
+        button {
+            background-color: #238636;
+            color: #ffffff;
+            border: 1px solid rgba(240,246,252,0.1);
+            padding: 12px 24px;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 6px;
+        }
+        button:hover { background-color: #2ea043; }
+        button.export-btn { background-color: #1f6feb; }
+        button.export-btn:hover { background-color: #388bfd; }
+        button:disabled {
+            background-color: #21262d;
+            color: #484f58;
+            border-color: transparent;
+            cursor: not-allowed;
+        }
+        #status {
+            margin: 15px 0;
+            font-weight: bold;
+            color: #d29922;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            background-color: #161b22;
+            font-size: 13px;
+        }
+        th, td {
+            border: 1px solid #30363d;
+            padding: 8px 10px;
+            text-align: right;
+        }
+        th { background-color: #21262d; color: #f0f6fc; }
+        tr:nth-child(even) { background-color: #0d1117; }
+
+        .dl-hdr { color: #58a6ff; }
+        .ul-hdr { color: #f0883e; }
+        .dl-val { color: #79c0ff; font-weight: bold; }
+        .ul-val { color: #ffa657; font-weight: bold; }
+
+        .rec-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .rec-card {
+            background-color: #161b22;
+            border-radius: 6px;
+            padding: 20px;
+            border: 1px solid #30363d;
+        }
+        .rec-card.latency { border-top: 4px solid #3fb950; }
+        .rec-card.throughput { border-top: 4px solid #f0883e; }
+
+        .rec-card h3 {
+            margin-top: 0;
+            font-size: 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .rec-card.latency h3 { color: #3fb950; }
+        .rec-card.throughput h3 { color: #f0883e; }
+
+        .badge {
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .rec-card.latency .badge { background-color: rgba(63, 185, 80, 0.15); color: #3fb950; }
+        .rec-card.throughput .badge { background-color: rgba(240, 136, 62, 0.15); color: #f0883e; }
+
+        .rec-list {
+            list-style: none;
+            padding: 0;
+            margin: 15px 0 0 0;
+        }
+        .rec-item {
+            background: #21262d;
+            padding: 10px 12px;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .rec-item:last-child { margin-bottom: 0; }
+        .rec-path { font-weight: bold; color: #f0f6fc; font-size: 13px; }
+        .rec-size { font-size: 14px; font-weight: bold; color: #d29922; }
+        .rec-stats { font-size: 11px; color: #8b949e; text-align: right; }
+        .rec-note { font-size: 11px; color: #8b949e; margin-top: 2px; }
+    </style>
+</head>
+<body>
+
+    <h1>Universal Hardware Interconnect Benchmark</h1>
+    <p>Runs automated empirical sweeps across system memory (RAM), GPU VRAM, CPU L3 Cache, Storage (Disk/SSD), and Thread Interprocess Communication (IPC) to find hardware optimal chunk sizes.</p>
+
+    <div class="controls">
+        <button id="startButton">Start Full Hardware Sweep</button>
+        <button id="exportButton" class="export-btn" disabled>Export Configuration (JSON)</button>
+    </div>
+    <div id="status">Status: Ready</div>
+
+    <h2>1. System RAM &leftrightarrow; GPU VRAM Sweep</h2>
+    <table id="ramGpuTable">
+        <thead>
+            <tr>
+                <th>Chunk Size</th>
+                <th class="ul-hdr">CPU RAM &rightarrow; GPU (Upload)</th>
+                <th class="ul-hdr">Upload Speed</th>
+                <th class="dl-hdr">GPU &rightarrow; CPU RAM (Download)</th>
+                <th class="dl-hdr">Download Speed</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <h2>2. CPU L3 Cache Residency &leftrightarrow; GPU VRAM Sweep</h2>
+    <table id="l3GpuTable">
+        <thead>
+            <tr>
+                <th>Chunk Size</th>
+                <th class="ul-hdr">L3 &rightarrow; GPU Time</th>
+                <th class="ul-hdr">L3 &rightarrow; GPU Speed</th>
+                <th class="dl-hdr">GPU &rightarrow; L3 Time</th>
+                <th class="dl-hdr">GPU &rightarrow; L3 Speed</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <h2>3. Disk / Storage &leftrightarrow; System RAM (IndexedDB Storage I/O) Sweep</h2>
+    <table id="diskRamTable">
+        <thead>
+            <tr>
+                <th>Chunk Size</th>
+                <th class="ul-hdr">RAM &rightarrow; Disk Write</th>
+                <th class="ul-hdr">Write Speed</th>
+                <th class="dl-hdr">Disk &rightarrow; RAM Read</th>
+                <th class="dl-hdr">Read Speed</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <h2>4. Disk / Storage &leftrightarrow; GPU VRAM Direct Pipelining Sweep</h2>
+    <table id="diskGpuTable">
+        <thead>
+            <tr>
+                <th>Chunk Size</th>
+                <th class="ul-hdr">Disk &rightarrow; GPU Pipeline</th>
+                <th class="ul-hdr">Pipeline Speed</th>
+                <th class="dl-hdr">GPU &rightarrow; Disk Pipeline</th>
+                <th class="dl-hdr">Pipeline Speed</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <h2>5. Main Thread &leftrightarrow; Web Worker Thread (IPC Bus) Sweep</h2>
+    <table id="threadIpcTable">
+        <thead>
+            <tr>
+                <th>Chunk Size</th>
+                <th class="ul-hdr">Transferable Latency</th>
+                <th class="ul-hdr">Transfer Bandwidth</th>
+                <th class="dl-hdr">Structured Copy Latency</th>
+                <th class="dl-hdr">Copy Bandwidth</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <h2>6. Dynamically Calculated Optimal Hardware Recommendations</h2>
+    <div class="rec-grid">
+        <div class="rec-card latency">
+            <h3>
+                Optimal Latency / Efficiency Ratio
+                <span class="badge">Real-Time / Low Delay</span>
+            </h3>
+            <p>Chunk sizes maximizing transfer efficiency without breaking tight latency budgets.</p>
+            <ul class="rec-list" id="latencyList">
+                <li class="rec-item">Run benchmark to determine hardware metrics...</li>
+            </ul>
+        </div>
+
+        <div class="rec-card throughput">
+            <h3>
+                Maximum Throughput
+                <span class="badge">Bulk Streaming / Max Speed</span>
+            </h3>
+            <p>Chunk sizes reaching peak bandwidth before hitting cache misses or driver queuing caps.</p>
+            <ul class="rec-list" id="throughputList">
+                <li class="rec-item">Run benchmark to determine hardware metrics...</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('startButton');
+        const exportBtn = document.getElementById('exportButton');
+        const statusDiv = document.getElementById('status');
+        const ITERATIONS = 5;
+        let generatedConfig = null;
+
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        }
+
+        async function initWebGPU() {
+            if (!navigator.gpu) throw new Error("WebGPU unsupported.");
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) throw new Error("No GPU Adapter.");
+            return await adapter.requestDevice();
+        }
+
+        // --- 1. RAM <-> GPU Benchmarks ---
+        async function measureCpuToGpu(device, size) {
+            const gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const cpuArray = new Uint8Array(size);
+            device.queue.writeBuffer(gpuBuffer, 0, cpuArray);
+            await device.queue.onSubmittedWorkDone();
+
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                device.queue.writeBuffer(gpuBuffer, 0, cpuArray);
+                await device.queue.onSubmittedWorkDone();
+            }
+            const time = (performance.now() - start) / ITERATIONS;
+            gpuBuffer.destroy();
+            return time;
+        }
+
+        async function measureGpuToCpu(device, size) {
+            const gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            const stagingBuffer = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+            const encoder = device.createCommandEncoder();
+            encoder.copyBufferToBuffer(gpuBuffer, 0, stagingBuffer, 0, size);
+            device.queue.submit([encoder.finish()]);
+            await stagingBuffer.mapAsync(GPUMapMode.READ);
+            stagingBuffer.unmap();
+
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                const enc = device.createCommandEncoder();
+                enc.copyBufferToBuffer(gpuBuffer, 0, stagingBuffer, 0, size);
+                device.queue.submit([enc.finish()]);
+                await stagingBuffer.mapAsync(GPUMapMode.READ);
+                stagingBuffer.unmap();
+            }
+            const time = (performance.now() - start) / ITERATIONS;
+            gpuBuffer.destroy();
+            stagingBuffer.destroy();
+            return time;
+        }
+
+        // --- 2. L3 Cache <-> GPU Benchmarks ---
+        async function measureL3ToGpu(device, size) {
+            const gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const cpuData = new Uint8Array(size);
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                for (let j = 0; j < size; j += 64) cpuData[j] = (j + i) & 0xFF; // Prime L3
+                device.queue.writeBuffer(gpuBuffer, 0, cpuData);
+                await device.queue.onSubmittedWorkDone();
+            }
+            const time = (performance.now() - start) / ITERATIONS;
+            gpuBuffer.destroy();
+            return time;
+        }
+
+        async function measureGpuToL3(device, size) {
+            const gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            const stagingBuffer = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+            let dummySum = 0;
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                const enc = device.createCommandEncoder();
+                enc.copyBufferToBuffer(gpuBuffer, 0, stagingBuffer, 0, size);
+                device.queue.submit([enc.finish()]);
+                await stagingBuffer.mapAsync(GPUMapMode.READ);
+                const arr = new Uint8Array(stagingBuffer.getMappedRange());
+                for (let j = 0; j < size; j += 64) dummySum += arr[j]; // Pull into L3
+                stagingBuffer.unmap();
+            }
+            const time = (performance.now() - start) / ITERATIONS;
+            gpuBuffer.destroy();
+            stagingBuffer.destroy();
+            return time;
+        }
+
+        // --- 3. Disk <-> RAM Benchmarks (IndexedDB Engine) ---
+        function getIDB() {
+            return new Promise((res, rej) => {
+                const req = indexedDB.open('TuningDB', 1);
+                req.onupgradeneeded = () => req.result.createObjectStore('chunks');
+                req.onsuccess = () => res(req.result);
+                req.onerror = () => rej(req.error);
+            });
+        }
+
+        async function measureDiskWrite(db, size) {
+            const data = new Uint8Array(size);
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                await new Promise((res) => {
+                    const tx = db.transaction('chunks', 'readwrite');
+                    tx.objectStore('chunks').put(data, 'chunk');
+                    tx.oncomplete = res;
+                });
+            }
+            return (performance.now() - start) / ITERATIONS;
+        }
+
+        async function measureDiskRead(db, size) {
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                await new Promise((res) => {
+                    const tx = db.transaction('chunks', 'readonly');
+                    const req = tx.objectStore('chunks').get('chunk');
+                    req.onsuccess = res;
+                });
+            }
+            return (performance.now() - start) / ITERATIONS;
+        }
+
+        // --- 4. Disk <-> GPU Pipeline Benchmarks ---
+        async function measureDiskToGpu(db, device, size) {
+            const gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                const data = await new Promise((res) => {
+                    const tx = db.transaction('chunks', 'readonly');
+                    const req = tx.objectStore('chunks').get('chunk');
+                    req.onsuccess = () => res(req.result);
+                });
+                device.queue.writeBuffer(gpuBuffer, 0, data);
+                await device.queue.onSubmittedWorkDone();
+            }
+            const time = (performance.now() - start) / ITERATIONS;
+            gpuBuffer.destroy();
+            return time;
+        }
+
+        async function measureGpuToDisk(db, device, size) {
+            const gpuBuffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            const stagingBuffer = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                const enc = device.createCommandEncoder();
+                enc.copyBufferToBuffer(gpuBuffer, 0, stagingBuffer, 0, size);
+                device.queue.submit([enc.finish()]);
+                await stagingBuffer.mapAsync(GPUMapMode.READ);
+                const data = new Uint8Array(stagingBuffer.getMappedRange().slice(0));
+                stagingBuffer.unmap();
+                await new Promise((res) => {
+                    const tx = db.transaction('chunks', 'readwrite');
+                    tx.objectStore('chunks').put(data, 'chunk');
+                    tx.oncomplete = res;
+                });
+            }
+            const time = (performance.now() - start) / ITERATIONS;
+            gpuBuffer.destroy();
+            stagingBuffer.destroy();
+            return time;
+        }
+
+        // --- 5. Thread IPC Benchmarks (Web Worker Bus) ---
+        function createWorker() {
+            const code = `
+                self.onmessage = (e) => {
+                    const { buffer, isTransfer } = e.data;
+                    if (isTransfer) {
+                        self.postMessage({ buffer }, [buffer]);
+                    } else {
+                        self.postMessage({ buffer });
+                    }
+                };
+            `;
+            const blob = new Blob([code], { type: 'application/javascript' });
+            return new Worker(URL.createObjectURL(blob));
+        }
+
+        async function measureIPC(worker, size, isTransfer) {
+            const start = performance.now();
+            for (let i = 0; i < ITERATIONS; i++) {
+                const buffer = new ArrayBuffer(size);
+                await new Promise((res) => {
+                    worker.onmessage = () => res();
+                    if (isTransfer) worker.postMessage({ buffer, isTransfer: true }, [buffer]);
+                    else worker.postMessage({ buffer, isTransfer: false });
+                });
+            }
+            return (performance.now() - start) / ITERATIONS;
+        }
+
+        // --- Analytics Engine ---
+        function analyze(data) {
+            const getOptimalLatency = (list, tKey, sKey) => [...list].sort((a, b) => (a[tKey] / a[sKey]) - (b[tKey] / b[sKey]))[0];
+            const getMaxThroughput = (list, sKey) => [...list].sort((a, b) => b[sKey] - a[sKey])[0];
+
+            return {
+                latency: {
+                    ramUpload: getOptimalLatency(data.ramGpu, 'c2gTime', 'c2gSpeed'),
+                    ramDownload: getOptimalLatency(data.ramGpu, 'g2cTime', 'g2cSpeed'),
+                    l3Upload: getOptimalLatency(data.l3Gpu, 'l3ToGpuTime', 'l3ToGpuSpeed'),
+                    l3Download: getOptimalLatency(data.l3Gpu, 'gpuToL3Time', 'gpuToL3Speed'),
+                    diskWrite: getOptimalLatency(data.diskRam, 'writeTime', 'writeSpeed'),
+                    diskRead: getOptimalLatency(data.diskRam, 'readTime', 'readSpeed'),
+                    diskToGpu: getOptimalLatency(data.diskGpu, 'd2gTime', 'd2gSpeed'),
+                    gpuToDisk: getOptimalLatency(data.diskGpu, 'g2dTime', 'g2dSpeed'),
+                    ipcTransfer: getOptimalLatency(data.ipc, 'transferTime', 'transferSpeed'),
+                    ipcCopy: getOptimalLatency(data.ipc, 'copyTime', 'copySpeed'),
+                },
+                throughput: {
+                    ramUpload: getMaxThroughput(data.ramGpu, 'c2gSpeed'),
+                    ramDownload: getMaxThroughput(data.ramGpu, 'g2cSpeed'),
+                    l3Upload: getMaxThroughput(data.l3Gpu, 'l3ToGpuSpeed'),
+                    l3Download: getMaxThroughput(data.l3Gpu, 'gpuToL3Speed'),
+                    diskWrite: getMaxThroughput(data.diskRam, 'writeSpeed'),
+                    diskRead: getMaxThroughput(data.diskRam, 'readSpeed'),
+                    diskToGpu: getMaxThroughput(data.diskGpu, 'd2gSpeed'),
+                    gpuToDisk: getMaxThroughput(data.diskGpu, 'g2dSpeed'),
+                    ipcTransfer: getMaxThroughput(data.ipc, 'transferSpeed'),
+                    ipcCopy: getMaxThroughput(data.ipc, 'copySpeed'),
+                }
+            };
+        }
+
+        function renderRow(tbody, html) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = html;
+            tbody.appendChild(tr);
+        }
+
+        function renderRecommendations(analysis) {
+            const item = (path, note, size, time, speed) => `
+                <li class="rec-item">
+                    <div>
+                        <div class="rec-path">${path}</div>
+                        <div class="rec-note">${note}</div>
+                    </div>
+                    <div>
+                        <div class="rec-size">${formatBytes(size)}</div>
+                        <div class="rec-stats">${time.toFixed(2)} ms | ${speed.toFixed(2)} MB/s</div>
+                    </div>
+                </li>
+            `;
+
+            const l = analysis.latency;
+            document.getElementById('latencyList').innerHTML = 
+                item('RAM → GPU Upload', 'Optimal compute frame ratio', l.ramUpload.size, l.ramUpload.c2gTime, l.ramUpload.c2gSpeed * 1024) +
+                item('GPU → RAM Download', 'Lowest stalls during readback', l.ramDownload.size, l.ramDownload.g2cTime, l.ramDownload.g2cSpeed * 1024) +
+                item('L3 → GPU (Warm)', 'Best L3 efficiency per write', l.l3Upload.size, l.l3Upload.l3ToGpuTime, l.l3Upload.l3ToGpuSpeed * 1024) +
+                item('Disk Write (Storage)', 'Optimal transactional commit delay', l.diskWrite.size, l.diskWrite.writeTime, l.diskWrite.writeSpeed * 1024) +
+                item('Disk → GPU Pipeline', 'Low-latency asset streaming', l.diskToGpu.size, l.diskToGpu.d2gTime, l.diskToGpu.d2gSpeed * 1024) +
+                item('Thread IPC (Zero-Copy)', 'Zero-copy boundary overhead', l.ipcTransfer.size, l.ipcTransfer.transferTime, l.ipcTransfer.transferSpeed * 1024);
+
+            const t = analysis.throughput;
+            document.getElementById('throughputList').innerHTML = 
+                item('RAM → GPU Upload', 'Peak bus saturation', t.ramUpload.size, t.ramUpload.c2gTime, t.ramUpload.c2gSpeed * 1024) +
+                item('GPU → RAM Download', 'Max physical transfer speed', t.ramDownload.size, t.ramDownload.g2cTime, t.ramDownload.g2cSpeed * 1024) +
+                item('L3 → GPU (Warm)', 'Max cache pipeline throughput', t.l3Upload.size, t.l3Upload.l3ToGpuTime, t.l3Upload.l3ToGpuSpeed * 1024) +
+                item('Disk Write (Storage)', 'Maximum sequential disk throughput', t.diskWrite.size, t.diskWrite.writeTime, t.diskWrite.writeSpeed * 1024) +
+                item('Disk → GPU Pipeline', 'Maximum sustained direct stream', t.diskToGpu.size, t.diskToGpu.d2gTime, t.diskToGpu.d2gSpeed * 1024) +
+                item('Thread IPC (Zero-Copy)', 'Max thread channel capacity', t.ipcTransfer.size, t.ipcTransfer.transferTime, t.ipcTransfer.transferSpeed * 1024);
+        }
+
+        async function runBenchmark() {
+            startBtn.disabled = true;
+            exportBtn.disabled = true;
+            
+            const ramGpuTb = document.getElementById('ramGpuTable').querySelector('tbody');
+            const l3GpuTb = document.getElementById('l3GpuTable').querySelector('tbody');
+            const diskRamTb = document.getElementById('diskRamTable').querySelector('tbody');
+            const diskGpuTb = document.getElementById('diskGpuTable').querySelector('tbody');
+            const threadIpcTb = document.getElementById('threadIpcTable').querySelector('tbody');
+
+            ramGpuTb.innerHTML = ''; l3GpuTb.innerHTML = ''; diskRamTb.innerHTML = ''; diskGpuTb.innerHTML = ''; threadIpcTb.innerHTML = '';
+
+            const results = { ramGpu: [], l3Gpu: [], diskRam: [], diskGpu: [], ipc: [] };
+
+            try {
+                statusDiv.innerText = "Initializing WebGPU & Storage Engines...";
+                const device = await initWebGPU();
+                const db = await getIDB();
+                const worker = createWorker();
+                const maxBuf = device.limits.maxBufferSize;
+
+                // 1. Sweep RAM <-> GPU
+                const sizes = [];
+                let sz = 4096;
+                while (sz <= Math.min(maxBuf, 128 * 1024 * 1024)) { sizes.push(sz); sz *= 2; }
+
+                for (const size of sizes) {
+                    statusDiv.innerText = `Sweeping RAM <-> GPU: ${formatBytes(size)}...`;
+                    await new Promise(r => setTimeout(r, 5));
+
+                    const c2gTime = await measureCpuToGpu(device, size);
+                    const g2cTime = await measureGpuToCpu(device, size);
+                    const c2gSpeed = (size / (c2gTime / 1000)) / (1024 * 1024 * 1024);
+                    const g2cSpeed = (size / (g2cTime / 1000)) / (1024 * 1024 * 1024);
+
+                    results.ramGpu.push({ size, c2gTime, c2gSpeed, g2cTime, g2cSpeed });
+                    renderRow(ramGpuTb, `
+                        <td>${formatBytes(size)}</td>
+                        <td>${c2gTime.toFixed(2)} ms</td>
+                        <td class="ul-val">${c2gSpeed.toFixed(3)} GB/s</td>
+                        <td>${g2cTime.toFixed(2)} ms</td>
+                        <td class="dl-val">${g2cSpeed.toFixed(3)} GB/s</td>
+                    `);
+                }
+
+                // 2. Sweep L3 <-> GPU
+                const l3Sizes = [64*1024, 256*1024, 512*1024, 1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024, 32*1024*1024].filter(s => s <= maxBuf);
+                for (const size of l3Sizes) {
+                    statusDiv.innerText = `Sweeping L3 Cache <-> GPU: ${formatBytes(size)}...`;
+                    await new Promise(r => setTimeout(r, 5));
+
+                    const l3ToGpuTime = await measureL3ToGpu(device, size);
+                    const gpuToL3Time = await measureGpuToL3(device, size);
+                    const l3ToGpuSpeed = (size / (l3ToGpuTime / 1000)) / (1024 * 1024 * 1024);
+                    const gpuToL3Speed = (size / (gpuToL3Time / 1000)) / (1024 * 1024 * 1024);
+
+                    results.l3Gpu.push({ size, l3ToGpuTime, l3ToGpuSpeed, gpuToL3Time, gpuToL3Speed });
+                    renderRow(l3GpuTb, `
+                        <td>${formatBytes(size)}</td>
+                        <td>${l3ToGpuTime.toFixed(2)} ms</td>
+                        <td class="ul-val">${l3ToGpuSpeed.toFixed(3)} GB/s</td>
+                        <td>${gpuToL3Time.toFixed(2)} ms</td>
+                        <td class="dl-val">${gpuToL3Speed.toFixed(3)} GB/s</td>
+                    `);
+                }
+
+                // 3. Sweep Disk <-> RAM
+                const diskSizes = [64*1024, 256*1024, 1024*1024, 4*1024*1024, 16*1024*1024, 32*1024*1024];
+                for (const size of diskSizes) {
+                    statusDiv.innerText = `Sweeping Disk <-> RAM: ${formatBytes(size)}...`;
+                    await new Promise(r => setTimeout(r, 5));
+
+                    const writeTime = await measureDiskWrite(db, size);
+                    const readTime = await measureDiskRead(db, size);
+                    const writeSpeed = (size / (writeTime / 1000)) / (1024 * 1024);
+                    const readSpeed = (size / (readTime / 1000)) / (1024 * 1024);
+
+                    results.diskRam.push({ size, writeTime, writeSpeed: writeSpeed / 1024, readTime, readSpeed: readSpeed / 1024 });
+                    renderRow(diskRamTb, `
+                        <td>${formatBytes(size)}</td>
+                        <td>${writeTime.toFixed(2)} ms</td>
+                        <td class="ul-val">${writeSpeed.toFixed(2)} MB/s</td>
+                        <td>${readTime.toFixed(2)} ms</td>
+                        <td class="dl-val">${readSpeed.toFixed(2)} MB/s</td>
+                    `);
+                }
+
+                // 4. Sweep Disk <-> GPU Pipeline
+                for (const size of diskSizes) {
+                    statusDiv.innerText = `Sweeping Disk <-> GPU Pipeline: ${formatBytes(size)}...`;
+                    await new Promise(r => setTimeout(r, 5));
+
+                    const d2gTime = await measureDiskToGpu(db, device, size);
+                    const g2dTime = await measureGpuToDisk(db, device, size);
+                    const d2gSpeed = (size / (d2gTime / 1000)) / (1024 * 1024);
+                    const g2dSpeed = (size / (g2dTime / 1000)) / (1024 * 1024);
+
+                    results.diskGpu.push({ size, d2gTime, d2gSpeed: d2gSpeed / 1024, g2dTime, g2dSpeed: g2dSpeed / 1024 });
+                    renderRow(diskGpuTb, `
+                        <td>${formatBytes(size)}</td>
+                        <td>${d2gTime.toFixed(2)} ms</td>
+                        <td class="ul-val">${d2gSpeed.toFixed(2)} MB/s</td>
+                        <td>${g2dTime.toFixed(2)} ms</td>
+                        <td class="dl-val">${g2dSpeed.toFixed(2)} MB/s</td>
+                    `);
+                }
+
+                // 5. Sweep Thread IPC
+                const ipcSizes = [4*1024, 64*1024, 256*1024, 1024*1024, 8*1024*1024, 32*1024*1024];
+                for (const size of ipcSizes) {
+                    statusDiv.innerText = `Sweeping Thread IPC: ${formatBytes(size)}...`;
+                    await new Promise(r => setTimeout(r, 5));
+
+                    const transferTime = await measureIPC(worker, size, true);
+                    const copyTime = await measureIPC(worker, size, false);
+                    const transferSpeed = (size / (transferTime / 1000)) / (1024 * 1024 * 1024);
+                    const copySpeed = (size / (copyTime / 1000)) / (1024 * 1024 * 1024);
+
+                    results.ipc.push({ size, transferTime, transferSpeed, copyTime, copySpeed });
+                    renderRow(threadIpcTb, `
+                        <td>${formatBytes(size)}</td>
+                        <td>${transferTime.toFixed(3)} ms</td>
+                        <td class="ul-val">${transferSpeed.toFixed(2)} GB/s</td>
+                        <td>${copyTime.toFixed(3)} ms</td>
+                        <td class="dl-val">${copySpeed.toFixed(2)} GB/s</td>
+                    `);
+                }
+
+                worker.terminate();
+                statusDiv.innerText = "Analyzing cross-hardware metrics...";
+                const analysis = analyze(results);
+                renderRecommendations(analysis);
+
+                generatedConfig = {
+                    timestamp: new Date().toISOString(),
+                    hardwareProfile: analysis
+                };
+
+                statusDiv.innerText = "Status: Universal Hardware Sweep Complete!";
+                exportBtn.disabled = false;
+            } catch (err) {
+                statusDiv.innerText = `Error: ${err.message}`;
+                console.error(err);
+            } finally {
+                startBtn.disabled = false;
+            }
+        }
+
+        exportBtn.addEventListener('click', () => {
+            if (!generatedConfig) return;
+            const blob = new Blob([JSON.stringify(generatedConfig, null, 4)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'full_hardware_system_config.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+
+        startBtn.addEventListener('click', runBenchmark);
+    </script>
+</body>
+</html>
