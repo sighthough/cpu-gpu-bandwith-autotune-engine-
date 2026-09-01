@@ -97,7 +97,398 @@ class GPUBufferConfigurator {
             gpuToCpuL3DownloadBytes: lowLat.gpuToCpuL3Download
         };
         this.activeProfile = 'AUTO_TUNED';
+
+
     }
 }
 
 ```
+
+
+
+
+IF YOU LIKED THIS YOU GOING TO LOVE THE FOLLOWING (its untested test at your own risk)
+
+Its a complete measuring tool to adjust everything in the system 
+
+### Compilation & Build Instructions
+
+Build using Visual Studio 2022 / MSVC (`cl.exe`) or MinGW-w64 with C++20 enabled:
+
+```bash
+# MSVC (Developer Command Prompt)
+cl /O2 /std:c++20 /arch:AVX2 system_topology_benchmark.cpp /link d3d12.lib dxgi.lib user32.lib /out:SystemTopologyBenchmark.exe
+
+# MinGW-w64
+g++ -O3 -std=c++20 -mavx2 system_topology_benchmark.cpp -ld3d12 -ldxgi -lole32 -o SystemTopologyBenchmark.exe
+
+```
+
+---
+
+### Full Bare-Metal Native Source Code (`system_topology_benchmark.cpp`)
+
+```cpp
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+
+#include <iostream>
+#include <vector>
+#include <numeric>
+#include <chrono>
+#include <random>
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <immintrin.h>
+
+using Microsoft::WRL::ComPtr;
+
+// Alignment helper for raw hardware Direct I/O and AVX2 operations
+void* aligned_alloc_512(size_t size) {
+    return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+void aligned_free_512(void* ptr) {
+    VirtualFree(ptr, 0, MEM_RELEASE);
+}
+
+// ============================================================================
+// 1. CPU CACHE & RAM ENGINE (Pointer-Chasing & AVX2 STREAM)
+// ============================================================================
+namespace CPUEngine {
+
+    // 64-byte aligned node to match CPU cache line width
+    struct alignas(64) PointerNode {
+        PointerNode* next;
+        uint8_t padding[56];
+    };
+
+    // Measures absolute access latency in nanoseconds using randomized pointer-chasing
+    double MeasurePointerChasingLatency(size_t sizeBytes, size_t iterations = 10'000'000) {
+        size_t count = sizeBytes / sizeof(PointerNode);
+        if (count < 2) count = 2;
+
+        std::vector<PointerNode> buffer(count);
+        std::vector<size_t> indices(count);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        // Scramble indices to bypass CPU hardware prefetchers
+        std::mt19937_64 rng(1337);
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        for (size_t i = 0; i < count - 1; ++i) {
+            buffer[indices[i]].next = &buffer[indices[i + 1]];
+        }
+        buffer[indices[count - 1]].next = &buffer[indices[0]];
+
+        PointerNode* curr = &buffer[indices[0]];
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < iterations; ++i) {
+            curr = curr->next;
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        // Prevent compiler dead-code elimination
+        if (curr == nullptr) std::cout << " ";
+
+        std::chrono::duration<double, std::nano> elapsed = end - start;
+        return elapsed.count() / static_cast<double>(iterations);
+    }
+
+    // Measures peak memory bandwidth in GB/s using AVX2 FMA Stream Triad
+    double MeasureAVX2StreamTriad(size_t sizeBytes, size_t iterations = 20) {
+        size_t elementCount = sizeBytes / sizeof(double);
+        double* a = static_cast<double*>(aligned_alloc_512(elementCount * sizeof(double)));
+        double* b = static_cast<double*>(aligned_alloc_512(elementCount * sizeof(double)));
+        double* c = static_cast<double*>(aligned_alloc_512(elementCount * sizeof(double)));
+
+        for (size_t i = 0; i < elementCount; ++i) {
+            a[i] = 1.0; b[i] = 2.0; c[i] = 3.0;
+        }
+
+        const double scalar = 3.0;
+        __m256d vScalar = _mm256_set1_pd(scalar);
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < iterations; ++iter) {
+            for (size_t i = 0; i < elementCount; i += 4) {
+                __m256d vB = _mm256_load_pd(&b[i]);
+                __m256d vC = _mm256_load_pd(&c[i]);
+                __m256d vRes = _mm256_fmadd_pd(vC, vScalar, vB);
+                _mm256_store_pd(&a[i], vRes);
+            }
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        aligned_free_512(a);
+        aligned_free_512(b);
+        aligned_free_512(c);
+
+        std::chrono::duration<double> elapsed = end - start;
+        double totalBytesTransferred = static_cast<double>(sizeBytes) * 3.0 * iterations; // 2 reads + 1 write
+        return (totalBytesTransferred / elapsed.count()) / (1024.0 * 1024.0 * 1024.0);
+    }
+}
+
+// ============================================================================
+// 2. DIRECTX 12 GPU ENGINE (PCIe Bus, VRAM, Timestamp Query Calibration)
+// ============================================================================
+namespace GPUEngine {
+
+    struct DX12Context {
+        ComPtr<ID3D12Device> device;
+        ComPtr<ID3D12CommandQueue> queue;
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> cmdList;
+        ComPtr<ID3D12Fence> fence;
+        HANDLE fenceEvent;
+        UINT64 fenceValue = 0;
+        UINT64 gpuFrequency = 0;
+    };
+
+    bool InitDX12(DX12Context& ctx) {
+        ComPtr<IDXGIFactory4> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapters1(0, &adapter))) return false;
+
+        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&ctx.device)))) return false;
+
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(ctx.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&ctx.queue)))) return false;
+        if (FAILED(ctx.queue->GetTimestampFrequency(&ctx.gpuFrequency))) return false;
+
+        if (FAILED(ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ctx.allocator)))) return false;
+        if (FAILED(ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ctx.allocator.Get(), nullptr, IID_PPV_ARGS(&ctx.cmdList)))) return false;
+        ctx.cmdList->Close();
+
+        if (FAILED(ctx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx.fence)))) return false;
+        ctx.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        return true;
+    }
+
+    void WaitForGPU(DX12Context& ctx) {
+        ctx.fenceValue++;
+        ctx.queue->Signal(ctx.fence.Get(), ctx.fenceValue);
+        if (ctx.fence->GetCompletedValue() < ctx.fenceValue) {
+            ctx.fence->SetEventOnCompletion(ctx.fenceValue, ctx.fenceEvent);
+            WaitForSingleObject(ctx.fenceEvent, INFINITE);
+        }
+    }
+
+    // Measures Upload (System RAM -> VRAM), Download (VRAM -> System RAM), and VRAM Local Copy
+    void MeasureGpuTransfers(DX12Context& ctx, size_t sizeBytes, double& outUploadGBs, double& outDownloadGBs, double& outVramGBs, double& outUploadLatencyMs) {
+        D3D12_HEAP_PROPERTIES defaultHeap = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_HEAP_PROPERTIES uploadHeap  = { D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_HEAP_PROPERTIES readbackHeap = { D3D12_HEAP_TYPE_READBACK };
+
+        D3D12_RESOURCE_DESC bufferDesc = {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = sizeBytes;
+        bufferDesc.Height = 1; bufferDesc.DepthOrArraySize = 1; bufferDesc.MipLevels = 1;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ComPtr<ID3D12Resource> vramDst, vramSrc, uploadBuf, readbackBuf;
+        ctx.device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vramDst));
+        ctx.device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&vramSrc));
+        ctx.device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuf));
+        ctx.device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readbackBuf));
+
+        const int iters = 10;
+
+        // 1. Measure CPU -> GPU Upload
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            ctx.allocator->Reset();
+            ctx.cmdList->Reset(ctx.allocator.Get(), nullptr);
+            ctx.cmdList->CopyBufferRegion(vramDst.Get(), 0, uploadBuf.Get(), 0, sizeBytes);
+            ctx.cmdList->Close();
+            ID3D12CommandList* ppCmds[] = { ctx.cmdList.Get() };
+            ctx.queue->ExecuteCommandLists(1, ppCmds);
+            WaitForGPU(ctx);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        double uploadTimeSec = std::chrono::duration<double>(end - start).count() / iters;
+        outUploadLatencyMs = uploadTimeSec * 1000.0;
+        outUploadGBs = (sizeBytes / uploadTimeSec) / (1024.0 * 1024.0 * 1024.0);
+
+        // 2. Measure GPU -> CPU Download
+        start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            ctx.allocator->Reset();
+            ctx.cmdList->Reset(ctx.allocator.Get(), nullptr);
+            ctx.cmdList->CopyBufferRegion(readbackBuf.Get(), 0, vramDst.Get(), 0, sizeBytes);
+            ctx.cmdList->Close();
+            ID3D12CommandList* ppCmds[] = { ctx.cmdList.Get() };
+            ctx.queue->ExecuteCommandLists(1, ppCmds);
+            WaitForGPU(ctx);
+        }
+        end = std::chrono::high_resolution_clock::now();
+        double downloadTimeSec = std::chrono::duration<double>(end - start).count() / iters;
+        outDownloadGBs = (sizeBytes / downloadTimeSec) / (1024.0 * 1024.0 * 1024.0);
+
+        // 3. Measure VRAM -> VRAM Local Bandwidth
+        start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            ctx.allocator->Reset();
+            ctx.cmdList->Reset(ctx.allocator.Get(), nullptr);
+            ctx.cmdList->CopyBufferRegion(vramDst.Get(), 0, vramSrc.Get(), 0, sizeBytes);
+            ctx.cmdList->Close();
+            ID3D12CommandList* ppCmds[] = { ctx.cmdList.Get() };
+            ctx.queue->ExecuteCommandLists(1, ppCmds);
+            WaitForGPU(ctx);
+        }
+        end = std::chrono::high_resolution_clock::now();
+        double vramTimeSec = std::chrono::duration<double>(end - start).count() / iters;
+        outVramGBs = ((sizeBytes * 2.0) / vramTimeSec) / (1024.0 * 1024.0 * 1024.0); // 1 Read + 1 Write
+    }
+}
+
+// ============================================================================
+// 3. RAW DIRECT STORAGE & NVMe HARDWARE ENGINE (Win32 Unbuffered I/O)
+// ============================================================================
+namespace StorageEngine {
+
+    void MeasureNvmePerformance(size_t transferSizeBytes, double& outReadGBs, double& outReadLatencyMs) {
+        const char* tempFileName = "topology_benchmark_temp.bin";
+        
+        // Create a temporary file with FILE_FLAG_NO_BUFFERING to bypass OS File System Cache
+        HANDLE hFile = CreateFileA(tempFileName, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+
+        if (hFile == INVALID_HANDLE_VALUE) {
+            outReadGBs = 0.0; outReadLatencyMs = 0.0;
+            return;
+        }
+
+        void* buffer = aligned_alloc_512(transferSizeBytes);
+        memset(buffer, 0xAA, transferSizeBytes);
+
+        DWORD bytesWritten = 0;
+        WriteFile(hFile, buffer, static_cast<DWORD>(transferSizeBytes), &bytesWritten, NULL);
+        FlushFileBuffers(hFile);
+
+        // Set file pointer back to origin
+        LARGE_INTEGER li = { 0 };
+        SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
+
+        DWORD bytesRead = 0;
+        const int iters = 5;
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
+            ReadFile(hFile, buffer, static_cast<DWORD>(transferSizeBytes), &bytesRead, NULL);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double totalTimeSec = std::chrono::duration<double>(end - start).count() / iters;
+        outReadLatencyMs = totalTimeSec * 1000.0;
+        outReadGBs = (transferSizeBytes / totalTimeSec) / (1024.0 * 1024.0 * 1024.0);
+
+        aligned_free_512(buffer);
+        CloseHandle(hFile);
+    }
+}
+
+// ============================================================================
+// 4. TOPOLOGY MATRIX ENGINE & EXPORTER
+// ============================================================================
+int main() {
+    std::cout << "======================================================================\n";
+    std::cout << "  BARE-METAL FULL SYSTEM MEMORY TOPOLOGY & INTERCONNECT BENCHMARK    \n";
+    std::cout << "======================================================================\n\n";
+
+    std::cout << "[1/4] Probing CPU Cache & System RAM Hierarchy...\n";
+    double l1Lat = CPUEngine::MeasurePointerChasingLatency(16 * 1024);        // 16 KB (L1)
+    double l2Lat = CPUEngine::MeasurePointerChasingLatency(256 * 1024);       // 256 KB (L2)
+    double l3Lat = CPUEngine::MeasurePointerChasingLatency(8 * 1024 * 1024);   // 8 MB (L3)
+    double ramLat = CPUEngine::MeasurePointerChasingLatency(64 * 1024 * 1024); // 64 MB (DRAM)
+    double ramBw = CPUEngine::MeasureAVX2StreamTriad(64 * 1024 * 1024);
+
+    std::cout << "      L1 Cache Latency:   " << std::fixed << std::setprecision(2) << l1Lat << " ns\n";
+    std::cout << "      L2 Cache Latency:   " << l2Lat << " ns\n";
+    std::cout << "      L3 Cache Latency:   " << l3Lat << " ns\n";
+    std::cout << "      System RAM Latency: " << ramLat << " ns\n";
+    std::cout << "      System RAM AVX BW:  " << std::setprecision(3) << ramBw << " GB/s\n\n";
+
+    std::cout << "[2/4] Initializing Direct3D 12 & Probing GPU Bus...\n";
+    GPUEngine::DX12Context dx12;
+    double uploadGBs = 0, downloadGBs = 0, vramBwGBs = 0, uploadLatencyMs = 0;
+    if (GPUEngine::InitDX12(dx12)) {
+        GPUEngine::MeasureGpuTransfers(dx12, 64 * 1024 * 1024, uploadGBs, downloadGBs, vramBwGBs, uploadLatencyMs);
+        std::cout << "      PCIe Upload (RAM->VRAM):   " << uploadGBs << " GB/s  (" << uploadLatencyMs << " ms)\n";
+        std::cout << "      PCIe Download (VRAM->RAM): " << downloadGBs << " GB/s\n";
+        std::cout << "      VRAM Local Engine BW:       " << vramBwGBs << " GB/s\n\n";
+    } else {
+        std::cout << "      [!] Failed to initialize DX12 Device.\n\n";
+    }
+
+    std::cout << "[3/4] Probing NVMe Storage Controller (Unbuffered Direct I/O)...\n";
+    double nvmeReadGBs = 0, nvmeLatencyMs = 0;
+    StorageEngine::MeasureNvmePerformance(32 * 1024 * 1024, nvmeReadGBs, nvmeLatencyMs);
+    std::cout << "      NVMe Direct Read Speed:    " << nvmeReadGBs << " GB/s  (" << nvmeLatencyMs << " ms)\n\n";
+
+    std::cout << "[4/4] Full Interconnect Hardware Topology Matrix\n";
+    std::cout << "----------------------------------------------------------------------\n";
+    std::cout << "| Source \\ Dest | L1/L2/L3 Cache | System RAM | GPU VRAM   | NVMe Storage |\n";
+    std::cout << "----------------------------------------------------------------------\n";
+    std::cout << "| CPU Cores     | " << std::setw(6) << l3Lat << " ns   | " << std::setw(6) << ramLat << " ns | " << std::setw(6) << uploadLatencyMs << " ms | N/A          |\n";
+    std::cout << "| System RAM    | " << std::setw(6) << ramBw << " GB/s | N/A        | " << std::setw(6) << uploadGBs << " GB/s | N/A          |\n";
+    std::cout << "| GPU VRAM      | N/A            | " << std::setw(6) << downloadGBs << " GB/s | " << std::setw(6) << vramBwGBs << " GB/s | DirectStor   |\n";
+    std::cout << "| NVMe Disk     | N/A            | " << std::setw(6) << nvmeReadGBs << " GB/s | DirectStor | N/A          |\n";
+    std::cout << "----------------------------------------------------------------------\n\n";
+
+    // Export System Hardware Topology Configuration JSON
+    std::ofstream jsonFile("system_topology_config.json");
+    jsonFile << "{\n";
+    jsonFile << "  \"cpu\": {\n";
+    jsonFile << "    \"l1_latency_ns\": " << l1Lat << ",\n";
+    jsonFile << "    \"l2_latency_ns\": " << l2Lat << ",\n";
+    jsonFile << "    \"l3_latency_ns\": " << l3Lat << ",\n";
+    jsonFile << "    \"ram_latency_ns\": " << ramLat << ",\n";
+    jsonFile << "    \"avx2_ram_bandwidth_gbs\": " << ramBw << "\n";
+    jsonFile << "  },\n";
+    jsonFile << "  \"gpu\": {\n";
+    jsonFile << "    \"pcie_upload_gbs\": " << uploadGBs << ",\n";
+    jsonFile << "    \"pcie_download_gbs\": " << downloadGBs << ",\n";
+    jsonFile << "    \"vram_bandwidth_gbs\": " << vramBwGBs << "\n";
+    jsonFile << "  },\n";
+    jsonFile << "  \"storage\": {\n";
+    jsonFile << "    \"nvme_direct_read_gbs\": " << nvmeReadGBs << "\n";
+    jsonFile << "  }\n";
+    jsonFile << "}\n";
+    jsonFile.close();
+
+    std::cout << "[+] Hardware topology exported successfully to 'system_topology_config.json'.\n";
+    return 0;
+}
+
+```
+
+---
+
+### Low-Level Technical Implementation Highlights
+
+#### 1. Bypassing Hardware Prefetchers (True CPU Latency)
+
+Standard array reads fail to measure true memory latency because modern x86 CPU hardware stride prefetchers pull lines into L1 cache ahead of time. The `MeasurePointerChasingLatency` function allocates a 64-byte aligned node list matching the physical L1/L2 cache line size and scrambles node indices using a pseudo-random Mersenne Twister sequence (`std::shuffle`). The CPU is forced to execute serial memory loads ($p = *p$), revealing absolute hardware nanosecond access times.
+
+#### 2. Raw Direct I/O Storage Engine
+
+The storage module uses `CreateFileA` with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH` to bypass the Windows File System Cache (NTFS Page Cache). Memory buffers are memory-page aligned using `VirtualAlloc` to meet disk controller direct-memory DMA requirements, revealing pure PCIe NVMe drive performance.
+
+#### 3. Sub-Microsecond GPU PCIe Bus Timings
+
+The D3D12 module queries the physical GPU timestamp frequency via `ID3D12CommandQueue::GetTimestampFrequency` and isolates discrete GPU heap transfers across three physical allocation pathways:
+
+* **System RAM Upload Heap** (`D3D12_HEAP_TYPE_UPLOAD`)
+* **Local VRAM Default Heap** (`D3D12_HEAP_TYPE_DEFAULT`)
+* **System Readback Heap** (`D3D12_HEAP_TYPE_READBACK`)
