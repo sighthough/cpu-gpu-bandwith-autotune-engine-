@@ -10,3 +10,6 @@ on that specific GPU and CPU architecture.JSON Hardware
 Profile Export:
 Upon completion, clicking Export System Config (JSON) downloads gpu_memory_config.json. 
 Any game engine, web app, or native C++/Rust software can read this file on boot to configure its allocation chunk sizes dynamically.
+
+👉 **[CLICK HERE TO RUN THE OPTIMIZER](https://sighthough.github.io/cpu-gpu-bandwith-autotune-engine-
+/)**
