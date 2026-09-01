@@ -1,5 +1,6 @@
 # cpu-gpu-bandwith-autotune-engine-
 this is a benchmark that measures your pc's cpu and gpu bandwiths over different chunks and provides a json file you can use in your project to set the optimal sizes for each
+make sure you are not runing any intesive 3d apps when you run it 
 
 *Co-authored by [sighthough](https://youtu.be/UtPiUGwu-0Q) and Gemini 3.6*
 
